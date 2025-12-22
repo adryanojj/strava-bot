@@ -96,10 +96,11 @@ function calcularPace(segundos, km) {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
+// Rota Inteligente: Versão "Sem ID/Data"
 app.get('/atualizar-clube', async (req, res) => {
     let connection;
     try {
-        console.log(">>> [DEBUG] Iniciando atualização do Clube...");
+        console.log(">>> [DEBUG] Iniciando atualização (Modo Hash)...");
 
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
@@ -115,78 +116,75 @@ app.get('/atualizar-clube', async (req, res) => {
         });
         
         const atividades = response.data;
-        console.log(`>>> [DEBUG] Strava retornou ${atividades.length} atividades.`);
-
-        if (atividades.length === 0) return res.json({ status: "Aviso", msg: "Lista vazia" });
-
-        // LOG EXTRA: Mostra as chaves da primeira atividade para conferirmos os nomes dos campos
-        if (atividades.length > 0) {
-            console.log(">>> [DEBUG] Campos da primeira atividade:", Object.keys(atividades[0]));
-        }
+        console.log(`>>> Encontradas ${atividades.length} atividades.`);
 
         connection = await mysql.createConnection(dbConfig);
         let novos = 0;
-        
-        // Ajuste a data de corte conforme necessário
-        const DATA_CORTE = new Date('2024-01-01T00:00:00'); 
 
         for (const act of atividades) {
             try {
-                // CORREÇÃO: Tenta pegar start_date se start_date_local falhar
-                const rawDate = act.start_date_local || act.start_date;
+                // 1. Filtra só corridas
+                if (act.type !== 'Run') continue;
+
+                const nome = `${act.athlete.firstname} ${act.athlete.lastname}`;
+                const dist = act.distance / 1000; // km
+                const tempo = act.moving_time; // segundos
+                const elevacao = act.total_elevation_gain;
                 
-                if (!rawDate) {
-                    console.log(`  ❌ Pular: Atividade "${act.name}" sem data definida.`);
-                    continue; // Pula para a próxima sem travar
+                // 2. CRIAÇÃO DO "PSEUDO-ID" (Já que o Strava esconde o ID real)
+                // O ID será: PRIMEIRO_NOME + DISTANCIA + TEMPO (Ex: "Adriano10.53600")
+                // Isso evita duplicar a mesma corrida.
+                const pseudoId = (act.athlete.firstname + dist.toFixed(2) + tempo).replace(/\s/g, '');
+                
+                // Transforma esse texto num número gigante (Fake ID) apenas para caber na coluna activity_id
+                // Usamos uma lógica simples de hash numérico
+                let hashId = 0;
+                for (let i = 0; i < pseudoId.length; i++) {
+                    hashId = ((hashId << 5) - hashId) + pseudoId.charCodeAt(i);
+                    hashId |= 0; 
                 }
+                const finalId = Math.abs(hashId); // Garante positivo
 
-                const actDate = new Date(rawDate);
-                const isRun = (act.type === 'Run');
-                const isRecent = (actDate >= DATA_CORTE);
+                // 3. Define a DATA como AGORA (já que o Strava esconde a data real)
+                // O formato deve ser YYYY-MM-DD HH:MM:SS
+                const dataHoje = new Date().toISOString().slice(0, 19).replace('T', ' ');
+                
+                const pace = calcularPace(tempo, dist);
 
-                console.log(`> Analisando: ${act.name} (${act.athlete.firstname}) | Data: ${rawDate}`);
+                console.log(`> Processando: ${nome} | ${dist.toFixed(2)}km | Hash: ${finalId}`);
 
-                if (isRun && isRecent) {
-                    const distanceKm = act.distance / 1000;
-                    const pace = calcularPace(act.moving_time, distanceKm);
-                    
-                    // Formata data para MySQL (YYYY-MM-DD HH:MM:SS)
-                    const mysqlDate = actDate.toISOString().slice(0, 19).replace('T', ' ');
+                // 4. Tenta Salvar (Se o ID já existir, o MySQL ignora graças ao IGNORE)
+                // OBS: Ajustei o SQL para usar o Pseudo-ID
+                const sql = `
+                    INSERT IGNORE INTO ranking_clube 
+                    (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `;
+                
+                const [result] = await connection.execute(sql, [
+                    finalId,
+                    nome,
+                    dataHoje,
+                    dist,
+                    tempo,
+                    elevacao,
+                    pace
+                ]);
 
-                    const sql = `
-                        INSERT IGNORE INTO ranking_clube 
-                        (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    `;
-                    
-                    const [result] = await connection.execute(sql, [
-                        act.id,
-                        `${act.athlete.firstname} ${act.athlete.lastname}`,
-                        mysqlDate,
-                        distanceKm,
-                        act.moving_time,
-                        act.total_elevation_gain,
-                        pace
-                    ]);
-
-                    if (result.affectedRows > 0) {
-                        console.log(`  ✅ SALVO!`);
-                        novos++;
-                    } else {
-                        console.log(`  ⚠️ Já existe.`);
-                    }
+                if (result.affectedRows > 0) {
+                    console.log(`  ✅ SALVO NO BANCO!`);
+                    novos++;
                 } else {
-                    if (!isRun) console.log(`  ❌ Não é corrida.`);
-                    else if (!isRecent) console.log(`  ❌ Data antiga.`);
+                    console.log(`  ⚠️ Já processado antes.`);
                 }
+
             } catch (innerError) {
-                console.error(`  ❌ Erro ao processar atividade específica: ${innerError.message}`);
-                // O loop continua mesmo com erro nessa atividade
+                console.error(`  ❌ Erro na linha: ${innerError.message}`);
             }
         }
 
         console.log(`>>> Finalizado. Total salvos: ${novos}`);
-        res.json({ status: "Sucesso", novas_atividades: novos });
+        res.json({ status: "Sucesso", novos_atividades: novos });
 
     } catch (error) {
         console.error("ERRO GERAL:", error.message);
