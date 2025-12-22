@@ -84,5 +84,93 @@ app.get('/atualizar', async (req, res) => {
     }
 });
 
+
+// ... (Mantenha as configurações de DB e Express que você já tem) ...
+
+// Função auxiliar para calcular Pace (Minutos por KM)
+function calcularPace(segundos, km) {
+    if (km <= 0) return "0:00";
+    const paceSeconds = seconds / km;
+    const mins = Math.floor(paceSeconds / 60);
+    const secs = Math.floor(paceSeconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+app.get('/atualizar-clube', async (req, res) => {
+    let connection;
+    try {
+        console.log(">>> Lendo Feed do Clube Doutores Runners...");
+
+        // 1. Renovando Token (Igual ao anterior)
+        const authResponse = await axios.post('https://www.strava.com/oauth/token', {
+            client_id: STRAVA_CONFIG.client_id,
+            client_secret: STRAVA_CONFIG.client_secret,
+            refresh_token: STRAVA_CONFIG.refresh_token,
+            grant_type: 'refresh_token'
+        });
+        const accessToken = authResponse.data.access_token;
+
+        // 2. Buscar Atividades do Clube
+        // Documentação: https://developers.strava.com/docs/reference/#api-Clubs-getClubActivitiesById
+        const headers = { Authorization: `Bearer ${accessToken}` };
+        const clubId = '1203095'; 
+        
+        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=50`, { headers });
+        const atividades = response.data;
+
+        console.log(`Encontradas ${atividades.length} atividades recentes.`);
+
+        connection = await mysql.createConnection(dbConfig);
+
+        let novos = 0;
+
+        // 3. Loop para salvar cada atividade
+        for (const act of atividades) {
+            // Filtro de Data: Só salva se for de 2026 em diante (ou mude para 2025 para testar agora)
+            // O formato do Strava é "2025-12-22T10:00:00Z"
+            if (act.type === 'Run') { // Opcional: Filtrar só corridas
+                const actDate = new Date(act.start_date_local);
+                
+                // DATA DE CORTE: Mude para '2026-01-01' quando for valer
+                // Para testar HOJE, deixe uma data antiga
+                if (actDate >= new Date('2025-12-22')) { 
+                    
+                    const distanceKm = act.distance / 1000;
+                    const pace = calcularPace(act.moving_time, distanceKm);
+                    
+                    // Usamos INSERT IGNORE para que, se o ID já existir, ele não faça nada (não duplica)
+                    // No MySQL 5.1 MyISAM, INSERT IGNORE funciona bem com Unique Key
+                    const sql = `
+                        INSERT IGNORE INTO ranking_clube 
+                        (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    `;
+                    
+                    const [result] = await connection.execute(sql, [
+                        act.id,
+                        `${act.athlete.firstname} ${act.athlete.lastname}`,
+                        act.start_date_local.replace('T', ' ').replace('Z', ''), // Formata para MySQL
+                        distanceKm,
+                        act.moving_time,
+                        act.total_elevation_gain,
+                        pace
+                    ]);
+
+                    if (result.affectedRows > 0) novos++;
+                }
+            }
+        }
+
+        console.log(`Processo finalizado. ${novos} novas corridas salvas.`);
+        res.json({ status: "Sucesso", novas_atividades: novos });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (connection) await connection.end();
+    }
+});
+
 app.get('/', (req, res) => res.send('Bot Strava Ativo.'));
 app.listen(port, () => console.log(`Rodando na porta ${port}`));
