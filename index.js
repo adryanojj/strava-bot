@@ -195,5 +195,7 @@ app.get('/atualizar-clube', async (req, res) => {
         if (connection) await connection.end();
     }
 });
+
+
 app.get('/', (req, res) => res.send('Bot Strava Ativo.'));
 app.listen(port, () => console.log(`Rodando na porta ${port}`));
