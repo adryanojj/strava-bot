@@ -133,7 +133,7 @@ app.get('/atualizar-clube', async (req, res) => {
                 
                 // DATA DE CORTE: Mude para '2026-01-01' quando for valer
                 // Para testar HOJE, deixe uma data antiga
-                if (actDate >= new Date('2025-12-22')) { 
+                if (actDate >= new Date('2025-12-20')) { 
                     
                     const distanceKm = act.distance / 1000;
                     const pace = calcularPace(act.moving_time, distanceKm);
