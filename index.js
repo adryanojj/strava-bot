@@ -102,7 +102,7 @@ app.get('/atualizar-clube', async (req, res) => {
     try {
         console.log(">>> [DEBUG] Iniciando atualização (Com Fotos)...");
 
-        const DATA_INICIO = new Date('2025-12-22T00:00:00'); // Data de corte
+        const DATA_INICIO = new Date('2025-12-21T00:00:00'); // Data de corte
 
         // Autenticação Strava
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
