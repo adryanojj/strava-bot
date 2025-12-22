@@ -12,100 +12,77 @@ const dbConfig = {
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
-    ssl: { rejectUnauthorized: false } // Necessário para conexão remota na maioria dos cPanels
+    ssl: { rejectUnauthorized: false } // Necessário para conexão remota
 };
 
-// Dados Reais do Strava
+// Configuração Strava
 const STRAVA_CONFIG = {
     client_id: process.env.STRAVA_CLIENT_ID,
     client_secret: process.env.STRAVA_CLIENT_SECRET,
     refresh_token: process.env.STRAVA_REFRESH_TOKEN_MASTER,
-    club_id: process.env.STRAVA_CLUB_ID // ID 1203095
+    club_id: process.env.STRAVA_CLUB_ID
 };
 
 app.get('/atualizar', async (req, res) => {
     let connection;
     try {
-        console.log(">>> Iniciando atualização agendada (Wellness - Doutores Runners)...");
+        console.log(">>> Iniciando atualização (Tabela: strava_atletas)...");
 
-        // 1. Obter Access Token Válido (Renovação)
+        // 1. Renovando Token
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
             client_secret: STRAVA_CONFIG.client_secret,
             refresh_token: STRAVA_CONFIG.refresh_token,
             grant_type: 'refresh_token'
         });
-
         const accessToken = authResponse.data.access_token;
-        console.log("1. Token de acesso renovado com sucesso.");
 
-        // 2. Buscar Dados do Atleta (Master)
+        // 2. Pegando Dados do Master
         const headers = { Authorization: `Bearer ${accessToken}` };
-        
         const atletaResponse = await axios.get('https://www.strava.com/api/v3/athlete', { headers });
+        
         const atletaId = atletaResponse.data.id;
-        const nome = `${atletaResponse.data.firstname} ${atletaResponse.data.lastname}`;
+        // Remove emojis do nome para evitar erro no MySQL 5.1 (utf8 simples)
+        const nome = `${atletaResponse.data.firstname} ${atletaResponse.data.lastname}`.replace(/([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF])/g, '');
         const foto = atletaResponse.data.profile;
 
-        console.log(`2. Atleta identificado: ${nome} (ID: ${atletaId})`);
-
-        // 3. Buscar Estatísticas Totais (Para pegar os 2.000 km)
+        // 3. Pegando KM Total (Run)
         const statsResponse = await axios.get(`https://www.strava.com/api/v3/athletes/${atletaId}/stats`, { headers });
-        
-        // Converte metros para KM (Pega YTD Run ou Ride dependendo do foco, aqui somando Run)
-        // Se quiser somar TUDO (Corrrida + Pedal + Natação), precisa somar os ytd_ de cada um.
-        // Focando em CORRIDA (Run) conforme contexto Wellness comum, mas ajuste se necessário.
         const kmTotal = (statsResponse.data.ytd_run_totals.distance / 1000); 
 
-        console.log(`3. Distância Total Ano Atual: ${kmTotal.toFixed(2)} km`);
+        console.log(`Atleta: ${nome} | KM: ${kmTotal.toFixed(2)}`);
 
-        // 4. Salvar no Banco de Dados MySQL
+        // 4. Salvando no MySQL
         connection = await mysql.createConnection(dbConfig);
         
-        // Verifica se o atleta já existe
-        const [rows] = await connection.execute('SELECT * FROM atletas WHERE strava_id = ?', [atletaId]);
+        // Verifica se existe
+        const [rows] = await connection.execute('SELECT * FROM strava_atletas WHERE strava_id = ?', [atletaId]);
 
         if (rows.length > 0) {
             await connection.execute(
-                'UPDATE atletas SET km_total = ?, foto = ?, nome = ?, updated_at = NOW() WHERE strava_id = ?',
+                'UPDATE strava_atletas SET km_total = ?, foto = ?, nome = ?, updated_at = NOW() WHERE strava_id = ?',
                 [kmTotal, foto, nome, atletaId]
             );
-            console.log("4. Banco de dados ATUALIZADO.");
+            console.log("Atualizado com sucesso.");
         } else {
-            // Se for o primeiro cadastro, marca como Master automaticamente se bater com o ID
-            const isMaster = (atletaId == 134323); // Pode ajustar essa lógica
+            // Se o ID for o seu (134323), define como Master (1), senão 0
+            const isMaster = (atletaId == 134323) ? 1 : 0;
             await connection.execute(
-                'INSERT INTO atletas (strava_id, nome, foto, km_total, isMaster) VALUES (?, ?, ?, ?, ?)',
+                'INSERT INTO strava_atletas (strava_id, nome, foto, km_total, isMaster) VALUES (?, ?, ?, ?, ?)',
                 [atletaId, nome, foto, kmTotal, isMaster]
             );
-            console.log("4. Atleta INSERIDO no banco.");
+            console.log("Inserido com sucesso.");
         }
 
-        res.status(200).send({
-            status: "Sucesso",
-            mensagem: `Dados atualizados para ${nome}`,
-            distancia_atual: `${kmTotal.toFixed(2)} km`,
-            clube: "Doutores Runners"
-        });
+        res.json({ status: "Sucesso", atleta: nome, km: kmTotal.toFixed(2) });
 
     } catch (error) {
-        console.error("ERRO CRÍTICO:", error.message);
-        if (error.response) console.error("Detalhes do erro Strava:", error.response.data);
-        
-        res.status(500).send({
-            status: "Erro",
-            erro: error.message
-        });
+        console.error(error);
+        res.status(500).json({ status: "Erro", msg: error.message });
     } finally {
         if (connection) await connection.end();
     }
 });
 
-// Rota raiz para checagem rápida
-app.get('/', (req, res) => {
-    res.send('API Strava Bot - Doutores Runners (Online) 🟢');
-});
-
-app.listen(port, () => {
-    console.log(`Servidor rodando na porta ${port}`);
-});
+app.get('/', (req, res) => res.send('Bot Strava Ativo.'));
+app.listen(port, () => console.log(`Rodando na porta ${port}`));
