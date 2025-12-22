@@ -100,9 +100,11 @@ function calcularPace(segundos, km) {
 app.get('/atualizar-clube', async (req, res) => {
     let connection;
     try {
-        console.log(">>> [DEBUG] Iniciando atualização (Modo Hash)...");
+        console.log(">>> [DEBUG] Iniciando atualização (Com Fotos)...");
 
-        // 1. Renovando Token
+        const DATA_INICIO = new Date('2025-12-22T00:00:00'); // Data de corte
+
+        // Autenticação Strava
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
             client_secret: STRAVA_CONFIG.client_secret,
@@ -111,82 +113,69 @@ app.get('/atualizar-clube', async (req, res) => {
         });
         const accessToken = authResponse.data.access_token;
 
-        // 2. Buscando Atividades
         const clubId = '1203095'; 
-        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=30`, {
+        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=50`, {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
         
         const atividades = response.data;
-        console.log(`>>> Encontradas ${atividades.length} atividades.`);
-
         connection = await mysql.createConnection(dbConfig);
         let novos = 0;
 
         for (const act of atividades) {
             try {
-                // Filtra apenas corridas (Run)
                 if (act.type !== 'Run') continue;
 
+                const dataString = act.start_date_local || act.start_date;
+                if (!dataString) continue;
+
+                const dataAtividade = new Date(dataString);
+                if (dataAtividade < DATA_INICIO) continue;
+
+                // --- DADOS BÁSICOS ---
                 const nome = `${act.athlete.firstname} ${act.athlete.lastname}`;
-                const dist = act.distance / 1000; // km
-                const tempo = act.moving_time; // segundos
+                const dist = act.distance / 1000; 
+                const tempo = act.moving_time; 
                 const elevacao = act.total_elevation_gain;
                 
-                // --- CRIAÇÃO DO FAKE ID ---
-                // Combina Nome + Distancia + Tempo para criar uma chave única
+                // --- NOVA PARTE: PEGAR A FOTO ---
+                // Tenta pegar a foto média, se não tiver, pega a padrão
+                const foto = act.athlete.profile_medium || act.athlete.profile || '';
+
+                // --- HASH ID (Para evitar duplicidade) ---
                 const pseudoId = (act.athlete.firstname + dist.toFixed(2) + tempo).replace(/\s/g, '');
-                
-                // Gera um número hash simples
                 let hashId = 0;
                 for (let i = 0; i < pseudoId.length; i++) {
                     hashId = ((hashId << 5) - hashId) + pseudoId.charCodeAt(i);
                     hashId |= 0; 
                 }
                 const finalId = Math.abs(hashId); 
-
-                // Data de Hoje (já que o Strava esconde a data real)
-                // Formato MySQL: YYYY-MM-DD HH:MM:SS
-                // Ajuste: Subtrai 3 horas para pegar horário de Brasília aproximado se o servidor for UTC
-                const agora = new Date();
-                agora.setHours(agora.getHours() - 3); 
-                const dataHoje = agora.toISOString().slice(0, 19).replace('T', ' ');
                 
+                const dataMySQL = dataString.replace('T', ' ').replace('Z', '');
                 const pace = calcularPace(tempo, dist);
 
-                console.log(`> Processando: ${nome} | ${dist.toFixed(2)}km | Pace: ${pace}`);
+                console.log(`> Processando: ${nome} (Com Foto)`);
 
-                // Tenta Salvar
+                // SQL ATUALIZADO COM A COLUNA athlete_photo
                 const sql = `
                     INSERT IGNORE INTO ranking_clube 
-                    (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display, athlete_photo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 `;
                 
                 const [result] = await connection.execute(sql, [
-                    finalId,
-                    nome,
-                    dataHoje,
-                    dist,
-                    tempo,
-                    elevacao,
-                    pace
+                    finalId, nome, dataMySQL, dist, tempo, elevacao, pace, foto
                 ]);
 
-                if (result.affectedRows > 0) {
-                    console.log(`  ✅ SALVO NO BANCO!`);
-                    novos++;
-                } else {
-                    console.log(`  ⚠️ Já processado antes.`);
-                }
+                if (result.affectedRows > 0) novos++;
 
             } catch (innerError) {
-                console.error(`  ❌ Erro na linha: ${innerError.message}`);
+                console.error(`  ❌ Erro: ${innerError.message}`);
             }
         }
 
-        console.log(`>>> Finalizado. Total salvos: ${novos}`);
-        res.json({ status: "Sucesso", novas_atividades: novos });
+        console.log(`>>> Finalizado. Salvos: ${novos}`);
+        res.json({ status: "Sucesso", novos_atividades: novos });
 
     } catch (error) {
         console.error("ERRO GERAL:", error.message);
