@@ -101,7 +101,6 @@ app.get('/atualizar-clube', async (req, res) => {
     try {
         console.log(">>> [DEBUG] Iniciando atualização do Clube...");
 
-        // 1. Renovando Token
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
             client_secret: STRAVA_CONFIG.client_secret,
@@ -110,10 +109,7 @@ app.get('/atualizar-clube', async (req, res) => {
         });
         const accessToken = authResponse.data.access_token;
 
-        // 2. Buscando Atividades
         const clubId = '1203095'; 
-        console.log(`>>> [DEBUG] Buscando atividades no clube ID: ${clubId}`);
-
         const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=30`, {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
@@ -121,71 +117,83 @@ app.get('/atualizar-clube', async (req, res) => {
         const atividades = response.data;
         console.log(`>>> [DEBUG] Strava retornou ${atividades.length} atividades.`);
 
-        if (atividades.length === 0) {
-            console.log(">>> [AVISO] Nenhuma atividade retornada pelo Strava. Verifique se o dono do token é membro do clube.");
-            return res.json({ status: "Aviso", msg: "Lista vazia do Strava" });
+        if (atividades.length === 0) return res.json({ status: "Aviso", msg: "Lista vazia" });
+
+        // LOG EXTRA: Mostra as chaves da primeira atividade para conferirmos os nomes dos campos
+        if (atividades.length > 0) {
+            console.log(">>> [DEBUG] Campos da primeira atividade:", Object.keys(atividades[0]));
         }
 
         connection = await mysql.createConnection(dbConfig);
         let novos = 0;
         
-        // Data de corte (ajuste conforme necessário)
-        const DATA_CORTE = new Date('2025-12-20T00:00:00'); 
-        console.log(`>>> [DEBUG] Filtrando atividades após: ${DATA_CORTE.toISOString()}`);
+        // Ajuste a data de corte conforme necessário
+        const DATA_CORTE = new Date('2024-01-01T00:00:00'); 
 
         for (const act of atividades) {
-            const actDate = new Date(act.start_date_local); // Data da corrida
-            const isRun = (act.type === 'Run'); // É corrida?
-            const isRecent = (actDate >= DATA_CORTE); // É nova?
-
-            // LOG PARA DESCOBRIR O PROBLEMA
-            // Vamos imprimir as primeiras 5 para não poluir demais, ou todas se forem poucas
-            console.log(`> Analisando: ${act.name} (${act.athlete.firstname}) | Tipo: ${act.type} | Data: ${act.start_date_local}`);
-
-            if (isRun && isRecent) {
-                const distanceKm = act.distance / 1000;
-                const pace = calcularPace(act.moving_time, distanceKm);
+            try {
+                // CORREÇÃO: Tenta pegar start_date se start_date_local falhar
+                const rawDate = act.start_date_local || act.start_date;
                 
-                const sql = `
-                    INSERT IGNORE INTO ranking_clube 
-                    (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                `;
-                
-                const [result] = await connection.execute(sql, [
-                    act.id,
-                    `${act.athlete.firstname} ${act.athlete.lastname}`,
-                    act.start_date_local.replace('T', ' ').replace('Z', ''),
-                    distanceKm,
-                    act.moving_time,
-                    act.total_elevation_gain,
-                    pace
-                ]);
-
-                if (result.affectedRows > 0) {
-                    console.log(`  ✅ SALVO NO BANCO!`);
-                    novos++;
-                } else {
-                    console.log(`  ⚠️ JÁ EXISTE NO BANCO (Ignorado)`);
+                if (!rawDate) {
+                    console.log(`  ❌ Pular: Atividade "${act.name}" sem data definida.`);
+                    continue; // Pula para a próxima sem travar
                 }
-            } else {
-                // Motivo de ter pulado
-                if (!isRun) console.log(`  ❌ Pulado: Não é corrida (é ${act.type})`);
-                else if (!isRecent) console.log(`  ❌ Pulado: Data antiga (${actDate.toISOString()} < Corte)`);
+
+                const actDate = new Date(rawDate);
+                const isRun = (act.type === 'Run');
+                const isRecent = (actDate >= DATA_CORTE);
+
+                console.log(`> Analisando: ${act.name} (${act.athlete.firstname}) | Data: ${rawDate}`);
+
+                if (isRun && isRecent) {
+                    const distanceKm = act.distance / 1000;
+                    const pace = calcularPace(act.moving_time, distanceKm);
+                    
+                    // Formata data para MySQL (YYYY-MM-DD HH:MM:SS)
+                    const mysqlDate = actDate.toISOString().slice(0, 19).replace('T', ' ');
+
+                    const sql = `
+                        INSERT IGNORE INTO ranking_clube 
+                        (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    `;
+                    
+                    const [result] = await connection.execute(sql, [
+                        act.id,
+                        `${act.athlete.firstname} ${act.athlete.lastname}`,
+                        mysqlDate,
+                        distanceKm,
+                        act.moving_time,
+                        act.total_elevation_gain,
+                        pace
+                    ]);
+
+                    if (result.affectedRows > 0) {
+                        console.log(`  ✅ SALVO!`);
+                        novos++;
+                    } else {
+                        console.log(`  ⚠️ Já existe.`);
+                    }
+                } else {
+                    if (!isRun) console.log(`  ❌ Não é corrida.`);
+                    else if (!isRecent) console.log(`  ❌ Data antiga.`);
+                }
+            } catch (innerError) {
+                console.error(`  ❌ Erro ao processar atividade específica: ${innerError.message}`);
+                // O loop continua mesmo com erro nessa atividade
             }
         }
 
         console.log(`>>> Finalizado. Total salvos: ${novos}`);
-        res.json({ status: "Sucesso", novas_atividades: novos, total_analisado: atividades.length });
+        res.json({ status: "Sucesso", novas_atividades: novos });
 
     } catch (error) {
-        console.error("ERRO:", error.message);
-        if (error.response) console.error("Dados do erro:", error.response.data);
+        console.error("ERRO GERAL:", error.message);
         res.status(500).json({ error: error.message });
     } finally {
         if (connection) await connection.end();
     }
 });
-
 app.get('/', (req, res) => res.send('Bot Strava Ativo.'));
 app.listen(port, () => console.log(`Rodando na porta ${port}`));
