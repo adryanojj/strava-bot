@@ -100,11 +100,9 @@ function calcularPace(segundos, km) {
 app.get('/atualizar-clube', async (req, res) => {
     let connection;
     try {
-        console.log(">>> [DEBUG] Iniciando atualização (Com Fotos)...");
+        console.log(">>> [DEBUG] Iniciando atualização (Versão Hash + Foto)...");
 
-        const DATA_INICIO = new Date('2025-12-21T00:00:00'); // Data de corte
-
-        // Autenticação Strava
+        // 1. Renovando Token
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
             client_secret: STRAVA_CONFIG.client_secret,
@@ -113,8 +111,9 @@ app.get('/atualizar-clube', async (req, res) => {
         });
         const accessToken = authResponse.data.access_token;
 
+        // 2. Buscando Atividades
         const clubId = '1203095'; 
-        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=50`, {
+        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=30`, {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
         
@@ -124,25 +123,37 @@ app.get('/atualizar-clube', async (req, res) => {
 
         for (const act of atividades) {
             try {
+                // Filtra apenas corridas
                 if (act.type !== 'Run') continue;
 
-                const dataString = act.start_date_local || act.start_date;
-                if (!dataString) continue;
+                // --- 1. LÓGICA DA DATA (A CORREÇÃO) ---
+                // Tenta pegar a data do Strava. 
+                // Se vier vazia (undefined), assume AGORA (new Date).
+                let dataMySQL;
+                const dataRaw = act.start_date_local || act.start_date;
 
-                const dataAtividade = new Date(dataString);
-                if (dataAtividade < DATA_INICIO) continue;
-
-                // --- DADOS BÁSICOS ---
+                if (dataRaw) {
+                    // Se o Strava mandou a data, usa ela
+                    dataMySQL = dataRaw.replace('T', ' ').replace('Z', '');
+                } else {
+                    // Se o Strava escondeu, assume HOJE (fuso horário -3h aprox)
+                    const agora = new Date();
+                    agora.setHours(agora.getHours() - 3); 
+                    dataMySQL = agora.toISOString().slice(0, 19).replace('T', ' ');
+                }
+                
+                // --- 2. DADOS DO ATLETA ---
                 const nome = `${act.athlete.firstname} ${act.athlete.lastname}`;
-                const dist = act.distance / 1000; 
-                const tempo = act.moving_time; 
+                const dist = act.distance / 1000; // km
+                const tempo = act.moving_time; // segundos
                 const elevacao = act.total_elevation_gain;
                 
-                // --- NOVA PARTE: PEGAR A FOTO ---
-                // Tenta pegar a foto média, se não tiver, pega a padrão
+                // --- 3. FOTO (NOVIDADE) ---
+                // Pega a foto média ou a original. Se não tiver, fica string vazia.
                 const foto = act.athlete.profile_medium || act.athlete.profile || '';
 
-                // --- HASH ID (Para evitar duplicidade) ---
+                // --- 4. HASH ID (SEGURANÇA CONTRA DUPLICIDADE) ---
+                // Cria um ID único baseado em Nome + Distância + Tempo
                 const pseudoId = (act.athlete.firstname + dist.toFixed(2) + tempo).replace(/\s/g, '');
                 let hashId = 0;
                 for (let i = 0; i < pseudoId.length; i++) {
@@ -150,13 +161,12 @@ app.get('/atualizar-clube', async (req, res) => {
                     hashId |= 0; 
                 }
                 const finalId = Math.abs(hashId); 
-                
-                const dataMySQL = dataString.replace('T', ' ').replace('Z', '');
+
                 const pace = calcularPace(tempo, dist);
 
-                console.log(`> Processando: ${nome} (Com Foto)`);
+                console.log(`> Processando: ${nome} | Foto: ${foto ? 'Sim' : 'Não'} | Data: ${dataMySQL}`);
 
-                // SQL ATUALIZADO COM A COLUNA athlete_photo
+                // --- 5. SALVAR NO BANCO ---
                 const sql = `
                     INSERT IGNORE INTO ranking_clube 
                     (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display, athlete_photo)
@@ -164,17 +174,26 @@ app.get('/atualizar-clube', async (req, res) => {
                 `;
                 
                 const [result] = await connection.execute(sql, [
-                    finalId, nome, dataMySQL, dist, tempo, elevacao, pace, foto
+                    finalId,
+                    nome,
+                    dataMySQL,
+                    dist,
+                    tempo,
+                    elevacao,
+                    pace,
+                    foto
                 ]);
 
-                if (result.affectedRows > 0) novos++;
+                if (result.affectedRows > 0) {
+                    novos++;
+                }
 
             } catch (innerError) {
-                console.error(`  ❌ Erro: ${innerError.message}`);
+                console.error(`  ❌ Erro na atividade: ${innerError.message}`);
             }
         }
 
-        console.log(`>>> Finalizado. Salvos: ${novos}`);
+        console.log(`>>> Finalizado. Total salvos: ${novos}`);
         res.json({ status: "Sucesso", novos_atividades: novos });
 
     } catch (error) {
