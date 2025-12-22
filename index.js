@@ -87,21 +87,22 @@ app.get('/atualizar', async (req, res) => {
 
 // ... (Mantenha as configurações de DB e Express que você já tem) ...
 
-// Função auxiliar para calcular Pace (Minutos por KM)
+// --- FUNÇÃO CORRIGIDA ---
 function calcularPace(segundos, km) {
     if (km <= 0) return "0:00";
-    const paceSeconds = seconds / km;
+    const paceSeconds = segundos / km; // AGORA ESTÁ CERTO (segundos)
     const mins = Math.floor(paceSeconds / 60);
     const secs = Math.floor(paceSeconds % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
-// Rota Inteligente: Versão "Sem ID/Data"
+// Rota Inteligente: Versão "Sem ID/Data" (Modo Hash)
 app.get('/atualizar-clube', async (req, res) => {
     let connection;
     try {
         console.log(">>> [DEBUG] Iniciando atualização (Modo Hash)...");
 
+        // 1. Renovando Token
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
             client_secret: STRAVA_CONFIG.client_secret,
@@ -110,6 +111,7 @@ app.get('/atualizar-clube', async (req, res) => {
         });
         const accessToken = authResponse.data.access_token;
 
+        // 2. Buscando Atividades
         const clubId = '1203095'; 
         const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=30`, {
             headers: { Authorization: `Bearer ${accessToken}` }
@@ -123,7 +125,7 @@ app.get('/atualizar-clube', async (req, res) => {
 
         for (const act of atividades) {
             try {
-                // 1. Filtra só corridas
+                // Filtra apenas corridas (Run)
                 if (act.type !== 'Run') continue;
 
                 const nome = `${act.athlete.firstname} ${act.athlete.lastname}`;
@@ -131,30 +133,30 @@ app.get('/atualizar-clube', async (req, res) => {
                 const tempo = act.moving_time; // segundos
                 const elevacao = act.total_elevation_gain;
                 
-                // 2. CRIAÇÃO DO "PSEUDO-ID" (Já que o Strava esconde o ID real)
-                // O ID será: PRIMEIRO_NOME + DISTANCIA + TEMPO (Ex: "Adriano10.53600")
-                // Isso evita duplicar a mesma corrida.
+                // --- CRIAÇÃO DO FAKE ID ---
+                // Combina Nome + Distancia + Tempo para criar uma chave única
                 const pseudoId = (act.athlete.firstname + dist.toFixed(2) + tempo).replace(/\s/g, '');
                 
-                // Transforma esse texto num número gigante (Fake ID) apenas para caber na coluna activity_id
-                // Usamos uma lógica simples de hash numérico
+                // Gera um número hash simples
                 let hashId = 0;
                 for (let i = 0; i < pseudoId.length; i++) {
                     hashId = ((hashId << 5) - hashId) + pseudoId.charCodeAt(i);
                     hashId |= 0; 
                 }
-                const finalId = Math.abs(hashId); // Garante positivo
+                const finalId = Math.abs(hashId); 
 
-                // 3. Define a DATA como AGORA (já que o Strava esconde a data real)
-                // O formato deve ser YYYY-MM-DD HH:MM:SS
-                const dataHoje = new Date().toISOString().slice(0, 19).replace('T', ' ');
+                // Data de Hoje (já que o Strava esconde a data real)
+                // Formato MySQL: YYYY-MM-DD HH:MM:SS
+                // Ajuste: Subtrai 3 horas para pegar horário de Brasília aproximado se o servidor for UTC
+                const agora = new Date();
+                agora.setHours(agora.getHours() - 3); 
+                const dataHoje = agora.toISOString().slice(0, 19).replace('T', ' ');
                 
                 const pace = calcularPace(tempo, dist);
 
-                console.log(`> Processando: ${nome} | ${dist.toFixed(2)}km | Hash: ${finalId}`);
+                console.log(`> Processando: ${nome} | ${dist.toFixed(2)}km | Pace: ${pace}`);
 
-                // 4. Tenta Salvar (Se o ID já existir, o MySQL ignora graças ao IGNORE)
-                // OBS: Ajustei o SQL para usar o Pseudo-ID
+                // Tenta Salvar
                 const sql = `
                     INSERT IGNORE INTO ranking_clube 
                     (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display)
@@ -184,7 +186,7 @@ app.get('/atualizar-clube', async (req, res) => {
         }
 
         console.log(`>>> Finalizado. Total salvos: ${novos}`);
-        res.json({ status: "Sucesso", novos_atividades: novos });
+        res.json({ status: "Sucesso", novas_atividades: novos });
 
     } catch (error) {
         console.error("ERRO GERAL:", error.message);
