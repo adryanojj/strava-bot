@@ -100,9 +100,12 @@ function calcularPace(segundos, km) {
 app.get('/atualizar-clube', async (req, res) => {
     let connection;
     try {
-        console.log(">>> [DEBUG] Iniciando atualização (Verificando FOTO)...");
+        console.log(">>> [DEBUG] Iniciando atualização (Nomes: Curto e Completo)...");
+        
+        // --- CONFIG ---
+        const DATA_INICIO = new Date('2025-12-22T00:00:00'); 
+        // --------------
 
-        // Autenticação
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
             client_secret: STRAVA_CONFIG.client_secret,
@@ -112,19 +115,11 @@ app.get('/atualizar-clube', async (req, res) => {
         const accessToken = authResponse.data.access_token;
 
         const clubId = '1203095'; 
-        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=30`, {
+        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=50`, {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
         
         const atividades = response.data;
-        
-        // --- DEBUG EXTRA: Olhar o primeiro atleta da lista ---
-        if (atividades.length > 0) {
-            console.log(">>> [DEBUG] Dados do 1º Atleta recebido:");
-            console.log(JSON.stringify(atividades[0].athlete, null, 2)); 
-        }
-        // ----------------------------------------------------
-
         connection = await mysql.createConnection(dbConfig);
         let novos = 0;
 
@@ -132,46 +127,57 @@ app.get('/atualizar-clube', async (req, res) => {
             try {
                 if (act.type !== 'Run') continue;
 
-                // Lógica de Data (Versão MacGyver)
+                // Data Lógica
                 let dataMySQL;
                 const dataRaw = act.start_date_local || act.start_date;
                 if (dataRaw) {
                     dataMySQL = dataRaw.replace('T', ' ').replace('Z', '');
+                    if (new Date(dataRaw) < DATA_INICIO) continue;
                 } else {
                     const agora = new Date();
                     agora.setHours(agora.getHours() - 3); 
                     dataMySQL = agora.toISOString().slice(0, 19).replace('T', ' ');
                 }
 
-                const nome = `${act.athlete.firstname} ${act.athlete.lastname}`;
+                // --- AQUI ESTÁ A MÁGICA DOS NOMES ---
+                const fName = act.athlete.firstname;
+                const lName = act.athlete.lastname;
+                
+                // 1. Nome Completo (Ex: Murilo Habash)
+                const nomeCompleto = `${fName} ${lName}`;
+                
+                // 2. Nome Resumido (Ex: Murilo H.)
+                // Se tiver sobrenome, pega a 1ª letra. Se não, usa só o primeiro nome.
+                const nomeResumido = lName ? `${fName} ${lName.charAt(0)}.` : fName;
+                // -------------------------------------
+
                 const dist = act.distance / 1000; 
                 const tempo = act.moving_time; 
                 const elevacao = act.total_elevation_gain;
-                
-                // --- TENTATIVA DE PEGAR FOTO ---
-                // Verifica todas as variações possíveis que o Strava costuma usar
-                const foto = act.athlete.profile_medium || act.athlete.profile || act.athlete.picture || '';
+                const foto = act.athlete.profile_medium || act.athlete.profile || '';
 
                 // Hash ID
-                const pseudoId = (act.athlete.firstname + dist.toFixed(2) + tempo).replace(/\s/g, '');
+                const pseudoId = (fName + dist.toFixed(2) + tempo).replace(/\s/g, '');
                 let hashId = 0;
                 for (let i = 0; i < pseudoId.length; i++) {
-                    hashId = ((hashId << 5) - hashId) + pseudoId.charCodeAt(i);
-                    hashId |= 0; 
+                    hashId = ((hashId << 5) - hashId) + pseudoId.charCodeAt(i); hashId |= 0; 
                 }
                 const finalId = Math.abs(hashId); 
                 const pace = calcularPace(tempo, dist);
 
-                console.log(`> Processando: ${nome} | Foto encontrada: ${foto ? 'SIM' : 'NÃO'}`);
+                console.log(`> Processando: ${nomeResumido} (Full: ${nomeCompleto})`);
 
+                // SALVA OS DOIS NOMES NO BANCO
+                // athlete_name = Resumido (usado no ranking)
+                // full_name = Completo (usado no modal)
                 const sql = `
                     INSERT IGNORE INTO ranking_clube 
-                    (activity_id, athlete_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display, athlete_photo)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (activity_id, athlete_name, full_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display, athlete_photo)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 `;
                 
                 const [result] = await connection.execute(sql, [
-                    finalId, nome, dataMySQL, dist, tempo, elevacao, pace, foto
+                    finalId, nomeResumido, nomeCompleto, dataMySQL, dist, tempo, elevacao, pace, foto
                 ]);
 
                 if (result.affectedRows > 0) novos++;
