@@ -17,9 +17,9 @@ const dbConfig = {
 // Configuração Strava
 const STRAVA_CONFIG = {
     client_id: process.env.STRAVA_CLIENT_ID,
-    client_secret: process.env.STRAVA_CLIENT_SECRET, // Lê do Environment
-    refresh_token: process.env.STRAVA_REFRESH_TOKEN_MASTER, // Lê do Environment
-    club_id: '1877008' // NOVO ID DO CLUBE ATUALIZADO
+    client_secret: process.env.STRAVA_CLIENT_SECRET, 
+    refresh_token: process.env.STRAVA_REFRESH_TOKEN_MASTER,
+    club_id: '1877008' 
 };
 
 function calcularPace(segundos, km) {
@@ -35,7 +35,6 @@ app.get('/atualizar-clube', async (req, res) => {
     try {
         console.log(">>> [DEBUG] Iniciando atualização Clube 1877008...");
 
-        // Data de corte para o projeto novo
         const DATA_INICIO = new Date('2026-02-01T00:00:00'); 
 
         // 1. Renovando Token
@@ -52,6 +51,16 @@ app.get('/atualizar-clube', async (req, res) => {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
         
+        // --- O ESPIÃO DE PERMISSÕES ---
+        // Vamos ver quais poderes este token tem
+        const scopes = response.headers['x-oauth-scopes'] || 'Desconhecido';
+        console.log(`>>> [DEBUG SCOPES] Permissões do Token: ${scopes}`);
+        
+        if (!scopes.includes('activity:read_all')) {
+            console.log(">>> [ALERTA CRÍTICO] O Token NÃO TEM permissão 'activity:read_all'. Por isso a data vem vazia!");
+        }
+        // -----------------------------
+
         const atividades = response.data;
         connection = await mysql.createConnection(dbConfig);
         let novos = 0;
@@ -60,19 +69,25 @@ app.get('/atualizar-clube', async (req, res) => {
             try {
                 if (act.type !== 'Run') continue;
 
-                // Lógica de Data
                 let dataMySQL;
                 const dataRaw = act.start_date_local || act.start_date;
+
+                // --- DIAGNÓSTICO FINAL DA DATA ---
+                if (!dataRaw) {
+                    // Imprime o objeto inteiro para vermos o que VEIO (se é que veio algo)
+                    console.log(`⚠️ Data indefinida para: ${act.name}. Campos recebidos: ${Object.keys(act).join(', ')}`);
+                }
+                // ---------------------------------
 
                 if (dataRaw) {
                     dataMySQL = dataRaw.replace('T', ' ').replace('Z', '');
                     if (new Date(dataRaw) < DATA_INICIO) continue;
                 } else {
-                    console.log(`  ⚠️ Aviso: Data indefinida para ${act.name}.`);
-                    continue; // Pula se não tiver data, para evitar erros
+                    const agora = new Date();
+                    agora.setHours(agora.getHours() - 3); 
+                    dataMySQL = agora.toISOString().slice(0, 19).replace('T', ' ');
                 }
 
-                // Nomes
                 const fName = act.athlete.firstname;
                 const lName = act.athlete.lastname;
                 const nomeCompleto = `${fName} ${lName}`;
@@ -83,7 +98,6 @@ app.get('/atualizar-clube', async (req, res) => {
                 const elevacao = act.total_elevation_gain;
                 const foto = act.athlete.profile_medium || act.athlete.profile || '';
 
-                // Hash ID
                 const pseudoId = (fName + dist.toFixed(2) + tempo).replace(/\s/g, '');
                 let hashId = 0;
                 for (let i = 0; i < pseudoId.length; i++) {
@@ -94,7 +108,6 @@ app.get('/atualizar-clube', async (req, res) => {
 
                 console.log(`> Processando: ${nomeResumido} | ${dataMySQL}`);
 
-                // Inserção no Banco (Tabela Nova)
                 const sql = `
                     INSERT IGNORE INTO Strava_fev_2026 
                     (activity_id, athlete_name, full_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display, athlete_photo)
@@ -113,7 +126,7 @@ app.get('/atualizar-clube', async (req, res) => {
         }
 
         console.log(`>>> Finalizado. Salvos: ${novos}`);
-        res.json({ status: "Sucesso", novos_atividades: novos, clube: STRAVA_CONFIG.club_id });
+        res.json({ status: "Sucesso", novos_atividades: novos, scopes_detectados: scopes });
 
     } catch (error) {
         console.error("ERRO GERAL:", error.message);
