@@ -1,24 +1,17 @@
-/* ===========================================================
-   Strava Bot - index.js (Render Web Service)
-   Node.js + Express + MySQL + Strava OAuth
-
-   Rotas:
-   - GET /health           -> ok
-   - GET /oauth/start      -> inicia OAuth
-   - GET /oauth/callback   -> recebe code e salva refresh_token por atleta
-   - GET /atualizar-clube  -> atualiza atividades (club feed + athletes)
-
-   ENV obrigatórias:
-   STRAVA_CLIENT_ID
-   STRAVA_CLIENT_SECRET
-   STRAVA_REDIRECT_URI        (ex: https://seu-app.onrender.com/oauth/callback)
-   STRAVA_CLUB_ID             (ex: 1877008)
-   DB_HOST DB_USER DB_PASSWORD DB_NAME
-
-   ENV opcionais:
-   STRAVA_REFRESH_TOKEN_MASTER (para puxar feed do clube)
-   DATA_INICIO                 (ex: 2026-02-01T00:00:00-03:00)
-   ============================================================ */
+/**
+ * Strava Bot - Render Web Service
+ * - Salva "club feed" mesmo quando vier CAPADO (sem data/id): salva como SNAPSHOT
+ * - Salva atividades COMPLETAS por atleta via OAuth (com data/id reais)
+ *
+ * Rotas:
+ * GET  /                   -> Online
+ * GET  /health             -> status
+ * GET  /oauth/start        -> inicia OAuth atleta
+ * GET  /oauth/callback     -> callback OAuth (salva refresh token do atleta)
+ * GET  /atualizar-clube    -> atualiza:
+ *                             A) snapshot do clube (sempre que possível)
+ *                             B) atividades completas dos atletas autorizados
+ */
 
 const express = require("express");
 const axios = require("axios");
@@ -26,34 +19,9 @@ const mysql = require("mysql2/promise");
 require("dotenv").config();
 
 const app = express();
-
-// ========= CONFIG =========
 const PORT = process.env.PORT || 3000;
 
-const DATA_INICIO = new Date(process.env.DATA_INICIO || "2026-02-01T00:00:00-03:00");
-
-const STRAVA = {
-  clientId: process.env.STRAVA_CLIENT_ID,
-  clientSecret: process.env.STRAVA_CLIENT_SECRET,
-  redirectUri: process.env.STRAVA_REDIRECT_URI,
-  clubId: process.env.STRAVA_CLUB_ID,
-  masterRefreshToken: process.env.STRAVA_REFRESH_TOKEN_MASTER || null,
-};
-
-const DB = {
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-};
-
-// ========= BOOT LOGS =========
-console.log("BOOT OK - iniciando app...");
-console.log("PORT =", PORT);
-console.log("DATA_INICIO =", DATA_INICIO.toISOString());
-console.log("CLUB_ID =", STRAVA.clubId);
-
-// ========= HELPERS =========
+// ============ ENV obrigatórias ============
 function assertEnv() {
   const required = [
     "STRAVA_CLIENT_ID",
@@ -69,16 +37,48 @@ function assertEnv() {
   if (missing.length) throw new Error(`Faltando ENV vars: ${missing.join(", ")}`);
 }
 
+// ============ Config ============
+const STRAVA = {
+  clientId: process.env.STRAVA_CLIENT_ID,
+  clientSecret: process.env.STRAVA_CLIENT_SECRET,
+  redirectUri: process.env.STRAVA_REDIRECT_URI, // ex: https://strava-bot-txum.onrender.com/oauth/callback
+  clubId: process.env.STRAVA_CLUB_ID,           // ex: 1877008
+  masterRefreshToken: process.env.STRAVA_REFRESH_TOKEN_MASTER || null, // recomendado para ler club feed
+};
+
+const DB = {
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+};
+
+// Data de corte para puxar atividades completas por atleta
+const DATA_INICIO = new Date(process.env.DATA_INICIO || "2026-02-01T00:00:00-03:00");
+
+// ============ Logs de boot ============
+console.log("BOOT OK - iniciando app...");
+console.log("PORT =", PORT);
+console.log("DATA_INICIO =", DATA_INICIO.toISOString());
+console.log("CLUB_ID =", STRAVA.clubId);
+console.log("MASTER_TOKEN =", STRAVA.masterRefreshToken ? "ON" : "OFF");
+
+// ============ Helpers ============
 function toMySQLDatetime(isoLike) {
   if (!isoLike) return null;
   return String(isoLike).replace("T", " ").replace("Z", "").slice(0, 19);
 }
-
 function toDateOnly(isoLike) {
   if (!isoLike) return null;
   return String(isoLike).slice(0, 10);
 }
-
+function todayDateBR() {
+  // snapshot_date em "YYYY-MM-DD" (BR -03 não precisa ser perfeito aqui; é apenas agrupamento)
+  const d = new Date();
+  // ajusta -03 para aproximar dia local do Brasil se sua instância estiver em UTC
+  d.setHours(d.getHours() - 3);
+  return d.toISOString().slice(0, 10);
+}
 function calcularPace(segundos, km) {
   if (!segundos || km <= 0) return "0:00";
   const paceSeconds = segundos / km;
@@ -86,11 +86,11 @@ function calcularPace(segundos, km) {
   const secs = Math.round(paceSeconds % 60);
   return `${mins}:${String(secs).padStart(2, "0")}`;
 }
-
 async function dbConn() {
   return mysql.createConnection(DB);
 }
 
+// ============ Strava OAuth ============
 async function refreshAccessToken(refreshToken) {
   const { data } = await axios.post("https://www.strava.com/oauth/token", {
     client_id: STRAVA.clientId,
@@ -111,6 +111,7 @@ async function exchangeCodeForTokens(code) {
   return data;
 }
 
+// ============ Fetch club feed (capado) ============
 async function fetchClubActivities(accessToken, { perPage = 50, maxPages = 3 } = {}) {
   const all = [];
   for (let page = 1; page <= maxPages; page++) {
@@ -125,6 +126,7 @@ async function fetchClubActivities(accessToken, { perPage = 50, maxPages = 3 } =
   return all;
 }
 
+// ============ Fetch atividades completas por atleta ============
 async function fetchAthleteActivities(accessToken, { afterUnix, perPage = 200, maxPages = 5 } = {}) {
   const all = [];
   for (let page = 1; page <= maxPages; page++) {
@@ -145,6 +147,7 @@ async function fetchAthleteActivities(accessToken, { afterUnix, perPage = 200, m
   return all;
 }
 
+// ============ DB: atletas autorizados ============
 async function upsertAthleteToken(connection, a) {
   const sql = `
     INSERT INTO strava_athletes
@@ -193,15 +196,22 @@ async function getValidAthleteAccessToken(connection, athleteRow) {
   return athleteRow.access_token;
 }
 
+// ============ DB: salvar atividades (completa e snapshot) ============
 async function upsertActivity(connection, row) {
   const sql = `
     INSERT INTO strava_activities
-      (unique_key, activity_id, athlete_id, source, activity_name,
+      (unique_key, source,
+       activity_id, athlete_id,
+       activity_name,
        activity_date, activity_date_only,
+       snapshot_date, collected_at,
        distance_km, moving_time_seconds, elevation_meters, pace_display,
        athlete_name, full_name, athlete_photo)
     VALUES
-      (?, ?, ?, ?, ?,
+      (?, ?,
+       ?, ?,
+       ?,
+       ?, ?,
        ?, ?,
        ?, ?, ?, ?,
        ?, ?, ?)
@@ -209,6 +219,8 @@ async function upsertActivity(connection, row) {
       activity_name=VALUES(activity_name),
       activity_date=VALUES(activity_date),
       activity_date_only=VALUES(activity_date_only),
+      snapshot_date=VALUES(snapshot_date),
+      collected_at=VALUES(collected_at),
       distance_km=VALUES(distance_km),
       moving_time_seconds=VALUES(moving_time_seconds),
       elevation_meters=VALUES(elevation_meters),
@@ -220,12 +232,14 @@ async function upsertActivity(connection, row) {
 
   const vals = [
     row.unique_key,
+    row.source,
     row.activity_id,
     row.athlete_id,
-    row.source,
     row.activity_name,
     row.activity_date,
     row.activity_date_only,
+    row.snapshot_date,
+    row.collected_at,
     row.distance_km,
     row.moving_time_seconds,
     row.elevation_meters,
@@ -239,17 +253,30 @@ async function upsertActivity(connection, row) {
   return result;
 }
 
-// ========= ROUTES =========
+// ===================================
+// ROTAS
+// ===================================
 app.get("/", (req, res) => res.send("Bot Strava Online ✅"));
-app.get("/health", (req, res) => res.json({ ok: true, port: PORT, data_inicio: DATA_INICIO.toISOString() }));
 
+app.get("/health", (req, res) =>
+  res.json({
+    ok: true,
+    port: PORT,
+    club_id: STRAVA.clubId,
+    data_inicio: DATA_INICIO.toISOString(),
+    club_enabled: Boolean(STRAVA.masterRefreshToken),
+  })
+);
+
+// Inicia OAuth atleta
 app.get("/oauth/start", (req, res) => {
   try {
     assertEnv();
 
-    // Scopes: read + activity:read_all
+    // IMPORTANTE: redirect_uri precisa bater com o que está permitido no Strava (Callback Domain)
     const scope = encodeURIComponent("read,activity:read_all");
     const redirect = encodeURIComponent(STRAVA.redirectUri);
+    const state = encodeURIComponent("doutoresrunners"); // simples e fixo
 
     const url =
       `https://www.strava.com/oauth/authorize` +
@@ -257,7 +284,11 @@ app.get("/oauth/start", (req, res) => {
       `&response_type=code` +
       `&redirect_uri=${redirect}` +
       `&approval_prompt=auto` +
-      `&scope=${scope}`;
+      `&scope=${scope}` +
+      `&state=${state}`;
+
+    console.log("OAUTH URL =", url);
+    console.log("REDIRECT URI =", STRAVA.redirectUri);
 
     return res.redirect(url);
   } catch (e) {
@@ -265,6 +296,7 @@ app.get("/oauth/start", (req, res) => {
   }
 });
 
+// Callback OAuth atleta
 app.get("/oauth/callback", async (req, res) => {
   let connection;
   try {
@@ -300,6 +332,7 @@ app.get("/oauth/callback", async (req, res) => {
   }
 });
 
+// Atualiza clube (snapshot) + atletas autorizados (completo)
 app.get("/atualizar-clube", async (req, res) => {
   let connection;
   try {
@@ -307,12 +340,16 @@ app.get("/atualizar-clube", async (req, res) => {
     connection = await dbConn();
 
     const afterUnix = Math.floor(DATA_INICIO.getTime() / 1000);
+    const snapshotDate = todayDateBR();
+    const collectedAt = toMySQLDatetime(new Date().toISOString());
 
     let upsertsTotal = 0;
-    let upsertsClub = 0;
-    let upsertsAthletes = 0;
+    let upsertsClubSnapshot = 0;
+    let upsertsAthletesFull = 0;
 
-    // ========= (A) CLUB FEED =========
+    // ======================================
+    // (A) CLUB FEED -> SNAPSHOT
+    // ======================================
     if (STRAVA.masterRefreshToken) {
       const refreshed = await refreshAccessToken(STRAVA.masterRefreshToken);
       const accessToken = refreshed.access_token;
@@ -334,37 +371,37 @@ app.get("/atualizar-clube", async (req, res) => {
         const tipo = String(act.type || "");
         if (tipo && !["Run", "VirtualRun", "TrailRun"].includes(tipo)) continue;
 
+        // Club feed veio CAPADO: sem data e sem id -> vamos salvar como snapshot
         const dataRaw = act.start_date_local || act.start_date || null;
-        if (!dataRaw) {
-          semData++;
-          continue;
-        }
-
-        const dt = new Date(dataRaw);
-        if (Number.isFinite(dt.getTime()) && dt < DATA_INICIO) continue;
+        if (!dataRaw) semData++;
 
         const distanceKm = (act.distance || 0) / 1000;
         const movingTime = act.moving_time || 0;
+        const elev = act.total_elevation_gain || 0;
         const pace = calcularPace(movingTime, distanceKm);
 
+        // athlete.id normalmente existe; se não, cai no "x"
         const athleteId = act.athlete?.id ? String(act.athlete.id) : null;
-        const activityId = act.id ? String(act.id) : null;
 
-        const uniqueKey = activityId
-          ? `club|${activityId}`
-          : `club|${athleteId || "x"}|${dataRaw}|${distanceKm.toFixed(2)}|${movingTime}`;
+        // UniqueKey de snapshot: agrupa por dia de coleta + atleta + métricas + nome
+        // (mesmo sem data da atividade real, você terá ranking do dia)
+        const uniqueKey = `club_snapshot|${snapshotDate}|${athleteId || "x"}|${distanceKm.toFixed(
+          2
+        )}|${movingTime}|${(act.name || "").slice(0, 40)}`;
 
         const result = await upsertActivity(connection, {
           unique_key: uniqueKey,
-          activity_id: activityId,
+          source: "club_snapshot",
+          activity_id: act.id ? String(act.id) : null, // geralmente undefined
           athlete_id: athleteId,
-          source: "club",
           activity_name: act.name || "",
-          activity_date: toMySQLDatetime(dataRaw),
-          activity_date_only: toDateOnly(dataRaw),
+          activity_date: dataRaw ? toMySQLDatetime(dataRaw) : null,         // provavelmente null
+          activity_date_only: dataRaw ? toDateOnly(dataRaw) : null,         // provavelmente null
+          snapshot_date: snapshotDate,                                      // sempre preenchido
+          collected_at: collectedAt,                                        // sempre preenchido
           distance_km: distanceKm,
           moving_time_seconds: movingTime,
-          elevation_meters: act.total_elevation_gain || 0,
+          elevation_meters: elev,
           pace_display: pace,
           athlete_name: athleteId ? `athlete_${athleteId}` : "athlete_desconhecido",
           full_name: athleteId ? `athlete_${athleteId}` : "athlete_desconhecido",
@@ -372,17 +409,19 @@ app.get("/atualizar-clube", async (req, res) => {
         });
 
         if (result.affectedRows > 0) {
-          upsertsClub++;
+          upsertsClubSnapshot++;
           upsertsTotal++;
         }
       }
 
       console.log("clubActs sem data =", semData);
     } else {
-      console.log("club feed desativado: STRAVA_REFRESH_TOKEN_MASTER não configurado.");
+      console.log("club snapshot desativado: STRAVA_REFRESH_TOKEN_MASTER não configurado.");
     }
 
-    // ========= (B) ATHLETES AUTH =========
+    // ======================================
+    // (B) ATLETAS AUTORIZADOS -> COMPLETO
+    // ======================================
     const athletes = await getAuthorizedAthletes(connection);
 
     for (const athlete of athletes) {
@@ -401,26 +440,30 @@ app.get("/atualizar-clube", async (req, res) => {
 
         const distanceKm = (act.distance || 0) / 1000;
         const movingTime = act.moving_time || 0;
+        const elev = act.total_elevation_gain || 0;
         const pace = calcularPace(movingTime, distanceKm);
 
         const athleteId = act.athlete?.id ? String(act.athlete.id) : String(athlete.athlete_id);
         const activityId = act.id ? String(act.id) : null;
 
+        // UniqueKey real (com ID) quando possível
         const uniqueKey = activityId
           ? `athlete|${athleteId}|${activityId}`
           : `athlete|${athleteId}|${dataRaw}|${distanceKm.toFixed(2)}|${movingTime}`;
 
         const result = await upsertActivity(connection, {
           unique_key: uniqueKey,
+          source: "athlete_full",
           activity_id: activityId,
           athlete_id: athleteId,
-          source: "athlete",
           activity_name: act.name || "",
           activity_date: toMySQLDatetime(dataRaw),
           activity_date_only: toDateOnly(dataRaw),
+          snapshot_date: null,
+          collected_at: collectedAt,
           distance_km: distanceKm,
           moving_time_seconds: movingTime,
-          elevation_meters: act.total_elevation_gain || 0,
+          elevation_meters: elev,
           pace_display: pace,
           athlete_name: athlete.full_name || `athlete_${athleteId}`,
           full_name: athlete.full_name || `athlete_${athleteId}`,
@@ -428,7 +471,7 @@ app.get("/atualizar-clube", async (req, res) => {
         });
 
         if (result.affectedRows > 0) {
-          upsertsAthletes++;
+          upsertsAthletesFull++;
           upsertsTotal++;
         }
       }
@@ -437,11 +480,12 @@ app.get("/atualizar-clube", async (req, res) => {
     return res.json({
       ok: true,
       data_inicio: DATA_INICIO.toISOString(),
+      snapshot_date: snapshotDate,
       club_enabled: Boolean(STRAVA.masterRefreshToken),
       athletes_authorized: athletes.length,
       upserts_total: upsertsTotal,
-      upserts_club: upsertsClub,
-      upserts_athletes: upsertsAthletes,
+      upserts_club_snapshot: upsertsClubSnapshot,
+      upserts_athletes_full: upsertsAthletesFull,
     });
   } catch (e) {
     console.error("Erro geral:", e.response?.data || e.message);
@@ -451,7 +495,7 @@ app.get("/atualizar-clube", async (req, res) => {
   }
 });
 
-// ========= LISTEN (Render) =========
+// ============ Render bind ============
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Rodando na porta ${PORT}`);
 });
