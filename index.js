@@ -1,15 +1,24 @@
-/**
- * index.js - Strava Bot (Render) - Node.js + Express + MySQL
- * Objetivo:
- *  - Salvar atividades do clube (feed) SEM quebrar quando a resposta vier limitada
- *  - Permitir que atletas autorizem via OAuth para puxar atividades completas por atleta
- *
- * Rotas:
- *  GET /                -> health
- *  GET /oauth/start     -> redireciona para autorização Strava
- *  GET /oauth/callback  -> recebe code, troca por tokens, salva no DB
- *  GET /atualizar-clube -> atualiza atividades via feed do clube + (opcional) por atletas autorizados
- */
+/* ============================================================
+   Strava Bot - index.js (Render Web Service)
+   Node.js + Express + MySQL + Strava OAuth
+
+   Rotas:
+   - GET /health           -> ok
+   - GET /oauth/start      -> inicia OAuth
+   - GET /oauth/callback   -> recebe code e salva refresh_token por atleta
+   - GET /atualizar-clube  -> atualiza atividades (club feed + athletes)
+
+   ENV obrigatórias:
+   STRAVA_CLIENT_ID
+   STRAVA_CLIENT_SECRET
+   STRAVA_REDIRECT_URI        (ex: https://seu-app.onrender.com/oauth/callback)
+   STRAVA_CLUB_ID             (ex: 1877008)
+   DB_HOST DB_USER DB_PASSWORD DB_NAME
+
+   ENV opcionais:
+   STRAVA_REFRESH_TOKEN_MASTER (para puxar feed do clube)
+   DATA_INICIO                 (ex: 2026-02-01T00:00:00-03:00)
+   ============================================================ */
 
 const express = require("express");
 const axios = require("axios");
@@ -17,17 +26,11 @@ const mysql = require("mysql2/promise");
 require("dotenv").config();
 
 const app = express();
-const port = process.env.PORT || 3000;
 
-// =====================
-// ENV obrigatórias
-// =====================
-// STRAVA_CLIENT_ID
-// STRAVA_CLIENT_SECRET
-// STRAVA_REDIRECT_URI           (ex.: https://seu-app.onrender.com/oauth/callback)
-// STRAVA_CLUB_ID                (ex.: 1877008)
-// STRAVA_REFRESH_TOKEN_MASTER   (opcional: se você tiver um token master)
-// DB_HOST, DB_USER, DB_PASSWORD, DB_NAME
+// ========= CONFIG =========
+const PORT = process.env.PORT || 3000;
+
+const DATA_INICIO = new Date(process.env.DATA_INICIO || "2026-02-01T00:00:00-03:00");
 
 const STRAVA = {
   clientId: process.env.STRAVA_CLIENT_ID,
@@ -44,12 +47,13 @@ const DB = {
   database: process.env.DB_NAME,
 };
 
-// Ajuste seu filtro de período aqui
-const DATA_INICIO = new Date(process.env.DATA_INICIO || "2026-02-01T00:00:00-03:00");
+// ========= BOOT LOGS =========
+console.log("BOOT OK - iniciando app...");
+console.log("PORT =", PORT);
+console.log("DATA_INICIO =", DATA_INICIO.toISOString());
+console.log("CLUB_ID =", STRAVA.clubId);
 
-// =====================
-// Helpers
-// =====================
+// ========= HELPERS =========
 function assertEnv() {
   const required = [
     "STRAVA_CLIENT_ID",
@@ -62,20 +66,17 @@ function assertEnv() {
     "DB_NAME",
   ];
   const missing = required.filter((k) => !process.env[k]);
-  if (missing.length) {
-    throw new Error(`Faltando ENV vars: ${missing.join(", ")}`);
-  }
+  if (missing.length) throw new Error(`Faltando ENV vars: ${missing.join(", ")}`);
 }
 
 function toMySQLDatetime(isoLike) {
-  // recebe "2026-02-02T07:42:15Z" ou "2026-02-02T07:42:15"
   if (!isoLike) return null;
   return String(isoLike).replace("T", " ").replace("Z", "").slice(0, 19);
 }
 
 function toDateOnly(isoLike) {
   if (!isoLike) return null;
-  return String(isoLike).slice(0, 10); // YYYY-MM-DD
+  return String(isoLike).slice(0, 10);
 }
 
 function calcularPace(segundos, km) {
@@ -90,27 +91,18 @@ async function dbConn() {
   return mysql.createConnection(DB);
 }
 
-/**
- * Refresh token -> access token (Strava)
- */
 async function refreshAccessToken(refreshToken) {
-  const url = "https://www.strava.com/oauth/token";
-  const { data } = await axios.post(url, {
+  const { data } = await axios.post("https://www.strava.com/oauth/token", {
     client_id: STRAVA.clientId,
     client_secret: STRAVA.clientSecret,
     grant_type: "refresh_token",
     refresh_token: refreshToken,
   });
-  // data: { access_token, refresh_token, expires_at, athlete... }
-  return data;
+  return data; // access_token, refresh_token, expires_at, athlete
 }
 
-/**
- * Troca code por tokens (OAuth callback)
- */
 async function exchangeCodeForTokens(code) {
-  const url = "https://www.strava.com/oauth/token";
-  const { data } = await axios.post(url, {
+  const { data } = await axios.post("https://www.strava.com/oauth/token", {
     client_id: STRAVA.clientId,
     client_secret: STRAVA.clientSecret,
     code,
@@ -119,14 +111,23 @@ async function exchangeCodeForTokens(code) {
   return data;
 }
 
-/**
- * GET /athlete/activities com paginação
- */
+async function fetchClubActivities(accessToken, { perPage = 50, maxPages = 3 } = {}) {
+  const all = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `https://www.strava.com/api/v3/clubs/${STRAVA.clubId}/activities?per_page=${perPage}&page=${page}`;
+    const resp = await axios.get(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const batch = resp.data || [];
+    all.push(...batch);
+    if (batch.length < perPage) break;
+  }
+  return all;
+}
+
 async function fetchAthleteActivities(accessToken, { afterUnix, perPage = 200, maxPages = 5 } = {}) {
   const all = [];
-  let page = 1;
-
-  while (page <= maxPages) {
+  for (let page = 1; page <= maxPages; page++) {
     const params = new URLSearchParams();
     params.set("per_page", String(perPage));
     params.set("page", String(page));
@@ -139,41 +140,59 @@ async function fetchAthleteActivities(accessToken, { afterUnix, perPage = 200, m
 
     const batch = resp.data || [];
     all.push(...batch);
-
     if (batch.length < perPage) break;
-    page += 1;
   }
   return all;
 }
 
-/**
- * GET /clubs/{id}/activities com paginação
- */
-async function fetchClubActivities(accessToken, { perPage = 50, maxPages = 3 } = {}) {
-  const all = [];
-  let page = 1;
+async function upsertAthleteToken(connection, a) {
+  const sql = `
+    INSERT INTO strava_athletes
+      (athlete_id, full_name, access_token, refresh_token, expires_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      full_name=VALUES(full_name),
+      access_token=VALUES(access_token),
+      refresh_token=VALUES(refresh_token),
+      expires_at=VALUES(expires_at)
+  `;
+  await connection.execute(sql, [
+    a.athlete_id,
+    a.full_name,
+    a.access_token,
+    a.refresh_token,
+    a.expires_at,
+  ]);
+}
 
-  while (page <= maxPages) {
-    const url = `https://www.strava.com/api/v3/clubs/${STRAVA.clubId}/activities?per_page=${perPage}&page=${page}`;
-    const resp = await axios.get(url, {
-      headers: { Authorization: `Bearer ${accessToken}` },
+async function getAuthorizedAthletes(connection) {
+  const [rows] = await connection.execute(
+    `SELECT athlete_id, full_name, refresh_token, access_token, expires_at FROM strava_athletes`
+  );
+  return rows || [];
+}
+
+async function getValidAthleteAccessToken(connection, athleteRow) {
+  const now = Math.floor(Date.now() / 1000);
+  const expiresAt = Number(athleteRow.expires_at || 0);
+
+  if (!athleteRow.access_token || expiresAt <= now + 60) {
+    const refreshed = await refreshAccessToken(athleteRow.refresh_token);
+    await upsertAthleteToken(connection, {
+      athlete_id: refreshed.athlete?.id || athleteRow.athlete_id,
+      full_name:
+        [refreshed.athlete?.firstname, refreshed.athlete?.lastname].filter(Boolean).join(" ").trim() ||
+        athleteRow.full_name ||
+        `athlete_${athleteRow.athlete_id}`,
+      access_token: refreshed.access_token,
+      refresh_token: refreshed.refresh_token,
+      expires_at: refreshed.expires_at,
     });
-
-    const batch = resp.data || [];
-    all.push(...batch);
-
-    if (batch.length < perPage) break;
-    page += 1;
+    return refreshed.access_token;
   }
-
-  return all;
+  return athleteRow.access_token;
 }
 
-/**
- * UPSERT na tabela de atividades
- * - unique_key evita duplicidade
- * - activity_id pode ser null quando vier “capado”
- */
 async function upsertActivity(connection, row) {
   const sql = `
     INSERT INTO strava_activities
@@ -187,16 +206,16 @@ async function upsertActivity(connection, row) {
        ?, ?, ?, ?,
        ?, ?, ?)
     ON DUPLICATE KEY UPDATE
-      activity_name = VALUES(activity_name),
-      activity_date = VALUES(activity_date),
-      activity_date_only = VALUES(activity_date_only),
-      distance_km = VALUES(distance_km),
-      moving_time_seconds = VALUES(moving_time_seconds),
-      elevation_meters = VALUES(elevation_meters),
-      pace_display = VALUES(pace_display),
-      athlete_name = VALUES(athlete_name),
-      full_name = VALUES(full_name),
-      athlete_photo = VALUES(athlete_photo)
+      activity_name=VALUES(activity_name),
+      activity_date=VALUES(activity_date),
+      activity_date_only=VALUES(activity_date_only),
+      distance_km=VALUES(distance_km),
+      moving_time_seconds=VALUES(moving_time_seconds),
+      elevation_meters=VALUES(elevation_meters),
+      pace_display=VALUES(pace_display),
+      athlete_name=VALUES(athlete_name),
+      full_name=VALUES(full_name),
+      athlete_photo=VALUES(athlete_photo)
   `;
 
   const vals = [
@@ -220,83 +239,18 @@ async function upsertActivity(connection, row) {
   return result;
 }
 
-/**
- * Salva/atualiza atleta autorizado (tokens)
- */
-async function upsertAthleteToken(connection, athlete) {
-  const sql = `
-    INSERT INTO strava_athletes
-      (athlete_id, full_name, access_token, refresh_token, expires_at)
-    VALUES
-      (?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      full_name = VALUES(full_name),
-      access_token = VALUES(access_token),
-      refresh_token = VALUES(refresh_token),
-      expires_at = VALUES(expires_at)
-  `;
-  const vals = [
-    athlete.athlete_id,
-    athlete.full_name,
-    athlete.access_token,
-    athlete.refresh_token,
-    athlete.expires_at,
-  ];
-  await connection.execute(sql, vals);
-}
+// ========= ROUTES =========
+app.get("/", (req, res) => res.send("Bot Strava Online ✅"));
+app.get("/health", (req, res) => res.json({ ok: true, port: PORT, data_inicio: DATA_INICIO.toISOString() }));
 
-/**
- * Lista atletas autorizados
- */
-async function getAuthorizedAthletes(connection) {
-  const [rows] = await connection.execute(
-    `SELECT athlete_id, full_name, refresh_token, expires_at, access_token
-     FROM strava_athletes`
-  );
-  return rows || [];
-}
-
-/**
- * Garante access token válido para um atleta (refresh quando necessário)
- */
-async function getValidAthleteAccessToken(connection, athleteRow) {
-  const now = Math.floor(Date.now() / 1000);
-  const expiresAt = Number(athleteRow.expires_at || 0);
-
-  // Se expira em menos de 60s, renova
-  if (!athleteRow.access_token || expiresAt <= now + 60) {
-    const refreshed = await refreshAccessToken(athleteRow.refresh_token);
-    const updated = {
-      athlete_id: refreshed.athlete?.id,
-      full_name: [refreshed.athlete?.firstname, refreshed.athlete?.lastname].filter(Boolean).join(" ").trim(),
-      access_token: refreshed.access_token,
-      refresh_token: refreshed.refresh_token,
-      expires_at: refreshed.expires_at,
-    };
-    await upsertAthleteToken(connection, updated);
-    return refreshed.access_token;
-  }
-  return athleteRow.access_token;
-}
-
-// =====================
-// Rotas
-// =====================
-app.get("/", (req, res) => {
-  res.send("Bot Strava Online ✅");
-});
-
-/**
- * Inicia OAuth para atletas
- * Scopes recomendados:
- *  - read: ler dados básicos
- *  - activity:read_all: ler atividades (dependendo do que você quer puxar)
- */
 app.get("/oauth/start", (req, res) => {
   try {
     assertEnv();
+
+    // Scopes: read + activity:read_all
     const scope = encodeURIComponent("read,activity:read_all");
     const redirect = encodeURIComponent(STRAVA.redirectUri);
+
     const url =
       `https://www.strava.com/oauth/authorize` +
       `?client_id=${STRAVA.clientId}` +
@@ -305,16 +259,12 @@ app.get("/oauth/start", (req, res) => {
       `&approval_prompt=auto` +
       `&scope=${scope}`;
 
-    res.redirect(url);
+    return res.redirect(url);
   } catch (e) {
-    res.status(500).send(e.message);
+    return res.status(500).send(e.message);
   }
 });
 
-/**
- * Callback OAuth
- * Recebe ?code=... e salva refresh_token por atleta
- */
 app.get("/oauth/callback", async (req, res) => {
   let connection;
   try {
@@ -328,7 +278,7 @@ app.get("/oauth/callback", async (req, res) => {
     const athleteId = data.athlete?.id;
     const fullName = [data.athlete?.firstname, data.athlete?.lastname].filter(Boolean).join(" ").trim();
 
-    if (!athleteId) return res.status(500).send("Não veio athlete.id no OAuth retorno.");
+    if (!athleteId) return res.status(500).send("Não veio athlete.id no retorno do OAuth.");
 
     connection = await dbConn();
     await upsertAthleteToken(connection, {
@@ -339,24 +289,17 @@ app.get("/oauth/callback", async (req, res) => {
       expires_at: data.expires_at,
     });
 
-    res.send(
-      `Autorização OK ✅\n` +
-      `Atleta: ${fullName || athleteId}\n` +
-      `Agora você pode rodar /atualizar-clube`
+    return res.send(
+      `Autorização OK ✅\nAtleta: ${fullName || athleteId}\nAgora rode: /atualizar-clube`
     );
   } catch (e) {
     console.error("OAuth callback error:", e.response?.data || e.message);
-    res.status(500).send("Erro no callback OAuth: " + (e.response?.data?.message || e.message));
+    return res.status(500).send("Erro no callback OAuth: " + (e.response?.data?.message || e.message));
   } finally {
     if (connection) await connection.end();
   }
 });
 
-/**
- * Atualiza atividades
- * 1) Puxa feed do clube usando MASTER refresh token (se existir)
- * 2) Puxa atividades completas dos atletas autorizados (recomendado)
- */
 app.get("/atualizar-clube", async (req, res) => {
   let connection;
   try {
@@ -365,44 +308,51 @@ app.get("/atualizar-clube", async (req, res) => {
 
     const afterUnix = Math.floor(DATA_INICIO.getTime() / 1000);
 
-    let totalUpserts = 0;
-    let clubeSalvos = 0;
-    let atletasSalvos = 0;
+    let upsertsTotal = 0;
+    let upsertsClub = 0;
+    let upsertsAthletes = 0;
 
-    // ============================
-    // (A) Clube: usa token master
-    // ============================
+    // ========= (A) CLUB FEED =========
     if (STRAVA.masterRefreshToken) {
       const refreshed = await refreshAccessToken(STRAVA.masterRefreshToken);
       const accessToken = refreshed.access_token;
 
       const clubActs = await fetchClubActivities(accessToken, { perPage: 50, maxPages: 3 });
 
+      console.log("clubActs.length =", clubActs.length);
+      if (clubActs[0]) {
+        console.log("clubActs[0].keys =", Object.keys(clubActs[0]));
+        console.log("clubActs[0].start_date_local =", clubActs[0].start_date_local);
+        console.log("clubActs[0].start_date =", clubActs[0].start_date);
+        console.log("clubActs[0].type =", clubActs[0].type);
+        console.log("clubActs[0].id =", clubActs[0].id);
+      }
+
+      let semData = 0;
+
       for (const act of clubActs) {
-        // Club feed pode vir limitado: trate como opcional
-        if (act.type && act.type !== "Run") continue;
+        const tipo = String(act.type || "");
+        if (tipo && !["Run", "VirtualRun", "TrailRun"].includes(tipo)) continue;
 
         const dataRaw = act.start_date_local || act.start_date || null;
-
-        // Se não vier data, não inventa: salva só se tiver uma chave minimamente estável
-        // (na prática, sem data é ruim; aqui vamos pular)
-        if (!dataRaw) continue;
+        if (!dataRaw) {
+          semData++;
+          continue;
+        }
 
         const dt = new Date(dataRaw);
         if (Number.isFinite(dt.getTime()) && dt < DATA_INICIO) continue;
 
         const distanceKm = (act.distance || 0) / 1000;
         const movingTime = act.moving_time || 0;
+        const pace = calcularPace(movingTime, distanceKm);
 
         const athleteId = act.athlete?.id ? String(act.athlete.id) : null;
         const activityId = act.id ? String(act.id) : null;
 
-        // Se não vier act.id, monta unique_key robusta
         const uniqueKey = activityId
           ? `club|${activityId}`
           : `club|${athleteId || "x"}|${dataRaw}|${distanceKm.toFixed(2)}|${movingTime}`;
-
-        const pace = calcularPace(movingTime, distanceKm);
 
         const result = await upsertActivity(connection, {
           unique_key: uniqueKey,
@@ -418,20 +368,21 @@ app.get("/atualizar-clube", async (req, res) => {
           pace_display: pace,
           athlete_name: athleteId ? `athlete_${athleteId}` : "athlete_desconhecido",
           full_name: athleteId ? `athlete_${athleteId}` : "athlete_desconhecido",
-          athlete_photo: "", // club feed normalmente não traz foto
+          athlete_photo: "",
         });
 
-        // mysql2: affectedRows pode ser 1 (insert) ou 2 (update)
         if (result.affectedRows > 0) {
-          clubeSalvos += 1;
-          totalUpserts += 1;
+          upsertsClub++;
+          upsertsTotal++;
         }
       }
+
+      console.log("clubActs sem data =", semData);
+    } else {
+      console.log("club feed desativado: STRAVA_REFRESH_TOKEN_MASTER não configurado.");
     }
 
-    // ==========================================
-    // (B) Atletas autorizados: atividades completas
-    // ==========================================
+    // ========= (B) ATHLETES AUTH =========
     const athletes = await getAuthorizedAthletes(connection);
 
     for (const athlete of athletes) {
@@ -439,7 +390,8 @@ app.get("/atualizar-clube", async (req, res) => {
       const acts = await fetchAthleteActivities(token, { afterUnix, perPage: 200, maxPages: 5 });
 
       for (const act of acts) {
-        if (act.type !== "Run") continue;
+        const tipo = String(act.type || "");
+        if (!["Run", "VirtualRun", "TrailRun"].includes(tipo)) continue;
 
         const dataRaw = act.start_date_local || act.start_date;
         if (!dataRaw) continue;
@@ -472,31 +424,34 @@ app.get("/atualizar-clube", async (req, res) => {
           pace_display: pace,
           athlete_name: athlete.full_name || `athlete_${athleteId}`,
           full_name: athlete.full_name || `athlete_${athleteId}`,
-          athlete_photo: "", // foto não vem em activities; você pode guardar separado se quiser
+          athlete_photo: "",
         });
 
         if (result.affectedRows > 0) {
-          atletasSalvos += 1;
-          totalUpserts += 1;
+          upsertsAthletes++;
+          upsertsTotal++;
         }
       }
     }
 
-    res.json({
+    return res.json({
       ok: true,
       data_inicio: DATA_INICIO.toISOString(),
       club_enabled: Boolean(STRAVA.masterRefreshToken),
       athletes_authorized: athletes.length,
-      upserts_total: totalUpserts,
-      upserts_club: clubeSalvos,
-      upserts_athletes: atletasSalvos,
+      upserts_total: upsertsTotal,
+      upserts_club: upsertsClub,
+      upserts_athletes: upsertsAthletes,
     });
   } catch (e) {
     console.error("Erro geral:", e.response?.data || e.message);
-    res.status(500).json({ ok: false, error: e.response?.data?.message || e.message });
+    return res.status(500).json({ ok: false, error: e.response?.data?.message || e.message });
   } finally {
     if (connection) await connection.end();
   }
 });
 
-app.listen(port, () => console.log(`Rodando na porta ${port}`));
+// ========= LISTEN (Render) =========
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Rodando na porta ${PORT}`);
+});
