@@ -11,8 +11,7 @@ const dbConfig = {
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    // ssl: { rejectUnauthorized: false } // Necessário para conexão remota
+    database: process.env.DB_NAME
 };
 
 // Configuração Strava
@@ -20,92 +19,27 @@ const STRAVA_CONFIG = {
     client_id: process.env.STRAVA_CLIENT_ID,
     client_secret: process.env.STRAVA_CLIENT_SECRET,
     refresh_token: process.env.STRAVA_REFRESH_TOKEN_MASTER,
-    club_id: process.env.STRAVA_CLUB_ID
+    club_id: '1877008' // --- NOVO ID DO CLUBE ---
 };
 
-app.get('/atualizar', async (req, res) => {
-    let connection;
-    try {
-        console.log(">>> Iniciando atualização (Tabela: strava_atletas)...");
-
-        // 1. Renovando Token
-        const authResponse = await axios.post('https://www.strava.com/oauth/token', {
-            client_id: STRAVA_CONFIG.client_id,
-            client_secret: STRAVA_CONFIG.client_secret,
-            refresh_token: STRAVA_CONFIG.refresh_token,
-            grant_type: 'refresh_token'
-        });
-        const accessToken = authResponse.data.access_token;
-
-        // 2. Pegando Dados do Master
-        const headers = { Authorization: `Bearer ${accessToken}` };
-        const atletaResponse = await axios.get('https://www.strava.com/api/v3/athlete', { headers });
-        
-        const atletaId = atletaResponse.data.id;
-        // Remove emojis do nome para evitar erro no MySQL 5.1 (utf8 simples)
-        const nome = `${atletaResponse.data.firstname} ${atletaResponse.data.lastname}`.replace(/([\u2700-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF])/g, '');
-        const foto = atletaResponse.data.profile;
-
-        // 3. Pegando KM Total (Run)
-        const statsResponse = await axios.get(`https://www.strava.com/api/v3/athletes/${atletaId}/stats`, { headers });
-        const kmTotal = (statsResponse.data.ytd_run_totals.distance / 1000); 
-
-        console.log(`Atleta: ${nome} | KM: ${kmTotal.toFixed(2)}`);
-
-        // 4. Salvando no MySQL
-        connection = await mysql.createConnection(dbConfig);
-        
-        // Verifica se existe
-        const [rows] = await connection.execute('SELECT * FROM strava_atletas WHERE strava_id = ?', [atletaId]);
-
-        if (rows.length > 0) {
-            await connection.execute(
-                'UPDATE strava_atletas SET km_total = ?, foto = ?, nome = ?, updated_at = NOW() WHERE strava_id = ?',
-                [kmTotal, foto, nome, atletaId]
-            );
-            console.log("Atualizado com sucesso.");
-        } else {
-            // Se o ID for o seu (134323), define como Master (1), senão 0
-            const isMaster = (atletaId == 134323) ? 1 : 0;
-            await connection.execute(
-                'INSERT INTO strava_atletas (strava_id, nome, foto, km_total, isMaster) VALUES (?, ?, ?, ?, ?)',
-                [atletaId, nome, foto, kmTotal, isMaster]
-            );
-            console.log("Inserido com sucesso.");
-        }
-
-        res.json({ status: "Sucesso", atleta: nome, km: kmTotal.toFixed(2) });
-
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ status: "Erro", msg: error.message });
-    } finally {
-        if (connection) await connection.end();
-    }
-});
-
-
-// ... (Mantenha as configurações de DB e Express que você já tem) ...
-
-// --- FUNÇÃO CORRIGIDA ---
 function calcularPace(segundos, km) {
     if (km <= 0) return "0:00";
-    const paceSeconds = segundos / km; // AGORA ESTÁ CERTO (segundos)
+    const paceSeconds = segundos / km;
     const mins = Math.floor(paceSeconds / 60);
     const secs = Math.floor(paceSeconds % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
-// Rota Inteligente: Versão "Sem ID/Data" (Modo Hash)
 app.get('/atualizar-clube', async (req, res) => {
     let connection;
     try {
-        console.log(">>> [DEBUG] Iniciando atualização (Nomes: Curto e Completo)...");
+        console.log(">>> [DEBUG] Atualizando Clube (Tabela Strava_fev_2026)...");
         
-        // --- CONFIG ---
-        const DATA_INICIO = new Date('2025-12-22T00:00:00'); 
-        // --------------
+        // --- DATA DE CORTE: 01/02/2026 ---
+        const DATA_INICIO = new Date('2026-02-01T00:00:00'); 
+        // ---------------------------------
 
+        // 1. Autenticação
         const authResponse = await axios.post('https://www.strava.com/oauth/token', {
             client_id: STRAVA_CONFIG.client_id,
             client_secret: STRAVA_CONFIG.client_secret,
@@ -114,8 +48,8 @@ app.get('/atualizar-clube', async (req, res) => {
         });
         const accessToken = authResponse.data.access_token;
 
-        const clubId = '1203095'; 
-        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${clubId}/activities?per_page=50`, {
+        // 2. Busca Atividades do NOVO CLUBE
+        const response = await axios.get(`https://www.strava.com/api/v3/clubs/${STRAVA_CONFIG.club_id}/activities?per_page=50`, {
             headers: { Authorization: `Bearer ${accessToken}` }
         });
         
@@ -127,29 +61,25 @@ app.get('/atualizar-clube', async (req, res) => {
             try {
                 if (act.type !== 'Run') continue;
 
-                // Data Lógica
+                // Lógica de Data
                 let dataMySQL;
                 const dataRaw = act.start_date_local || act.start_date;
                 if (dataRaw) {
                     dataMySQL = dataRaw.replace('T', ' ').replace('Z', '');
+                    // Filtra se for anterior a 01/02/2026
                     if (new Date(dataRaw) < DATA_INICIO) continue;
                 } else {
+                    // Se não vier data, assume AGORA (mas cuidado se rodar em data errada)
                     const agora = new Date();
                     agora.setHours(agora.getHours() - 3); 
                     dataMySQL = agora.toISOString().slice(0, 19).replace('T', ' ');
                 }
 
-                // --- AQUI ESTÁ A MÁGICA DOS NOMES ---
+                // Nomes (Resumido e Completo)
                 const fName = act.athlete.firstname;
                 const lName = act.athlete.lastname;
-                
-                // 1. Nome Completo (Ex: Murilo Habash)
                 const nomeCompleto = `${fName} ${lName}`;
-                
-                // 2. Nome Resumido (Ex: Murilo H.)
-                // Se tiver sobrenome, pega a 1ª letra. Se não, usa só o primeiro nome.
                 const nomeResumido = lName ? `${fName} ${lName.charAt(0)}.` : fName;
-                // -------------------------------------
 
                 const dist = act.distance / 1000; 
                 const tempo = act.moving_time; 
@@ -167,11 +97,9 @@ app.get('/atualizar-clube', async (req, res) => {
 
                 console.log(`> Processando: ${nomeResumido} (Full: ${nomeCompleto})`);
 
-                // SALVA OS DOIS NOMES NO BANCO
-                // athlete_name = Resumido (usado no ranking)
-                // full_name = Completo (usado no modal)
+                // --- INSERT NA NOVA TABELA ---
                 const sql = `
-                    INSERT IGNORE INTO ranking_clube 
+                    INSERT IGNORE INTO Strava_fev_2026 
                     (activity_id, athlete_name, full_name, activity_date, distance_km, moving_time_seconds, elevation_meters, pace_display, athlete_photo)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 `;
@@ -188,7 +116,7 @@ app.get('/atualizar-clube', async (req, res) => {
         }
 
         console.log(`>>> Finalizado. Salvos: ${novos}`);
-        res.json({ status: "Sucesso", novos_atividades: novos });
+        res.json({ status: "Sucesso", novos_atividades: novos, tabela: "Strava_fev_2026" });
 
     } catch (error) {
         console.error("ERRO GERAL:", error.message);
@@ -198,6 +126,5 @@ app.get('/atualizar-clube', async (req, res) => {
     }
 });
 
-
-app.get('/', (req, res) => res.send('Bot Strava Ativo.'));
+app.get('/', (req, res) => res.send('Bot Strava 2026 Ativo'));
 app.listen(port, () => console.log(`Rodando na porta ${port}`));
